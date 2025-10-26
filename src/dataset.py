@@ -102,12 +102,26 @@ class HeightEstimationDataset(Dataset):
         valid_clips.sort(key=lambda x: x['clip_id'])
         return valid_clips
 
-    def _compute_height_norm_params(self) -> Dict[str, float]:
-        """Compute min/max height values across all training DSMs after grounding."""
-        print("Computing height normalization parameters...")
+    def _compute_height_norm_params(self, max_samples: int = 500) -> Dict[str, float]:
+        """Compute min/max height values from a sample of training DSMs after grounding.
+
+        Args:
+            max_samples: Maximum number of clips to sample for computing normalization.
+                        Using a sample is much faster for large datasets (e.g., 5000+ clips).
+        """
+        import random
+
+        # Sample clips if we have more than max_samples
+        if len(self.clips) > max_samples:
+            sample_clips = random.sample(self.clips, max_samples)
+            print(f"Computing height normalization from {max_samples} sampled clips (out of {len(self.clips)})...")
+        else:
+            sample_clips = self.clips
+            print(f"Computing height normalization from all {len(self.clips)} clips...")
+
         all_relative_heights = []
 
-        for clip in self.clips:
+        for clip in sample_clips:
             dsm = np.array(Image.open(clip['dsm'])).astype(np.float32)
 
             # Ground each DSM: clip at 2nd percentile and subtract to set base to 0m
@@ -198,22 +212,58 @@ class HeightEstimationDataset(Dataset):
 def create_dataloaders(
     data_dir: str,
     batch_size: int = 8,
-    num_workers: int = 4
+    num_workers: int = 4,
+    force_recompute: bool = False
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Dict[str, float]]:
     """Create train and validation dataloaders.
+
+    Args:
+        data_dir: Path to data directory
+        batch_size: Batch size for dataloaders
+        num_workers: Number of worker processes for data loading
+        force_recompute: If True, recompute normalization params even if cached
 
     Returns:
         train_loader, val_loader, height_norm_params
     """
-    # Create train dataset and compute normalization params
-    train_dataset = HeightEstimationDataset(
-        data_dir=data_dir,
-        split='train',
-        compute_norm_params=True
-    )
+    import json
 
-    # Get normalization params from train set
-    height_norm_params = train_dataset.height_norm_params
+    data_path = Path(data_dir)
+    cache_file = data_path / 'height_norm_params_cache.json'
+
+    # Try to load cached normalization params
+    if cache_file.exists() and not force_recompute:
+        print(f"Loading cached normalization params from {cache_file}")
+        with open(cache_file, 'r') as f:
+            height_norm_params = json.load(f)
+        print(f"  min={height_norm_params['min']:.2f}, max={height_norm_params['max']:.2f}")
+
+        # Create datasets with cached params
+        train_dataset = HeightEstimationDataset(
+            data_dir=data_dir,
+            split='train',
+            height_norm_params=height_norm_params
+        )
+    else:
+        # Compute normalization params
+        if force_recompute:
+            print("Force recomputing normalization params...")
+        else:
+            print("No cached params found. Computing normalization params...")
+
+        train_dataset = HeightEstimationDataset(
+            data_dir=data_dir,
+            split='train',
+            compute_norm_params=True
+        )
+
+        # Get and cache normalization params
+        height_norm_params = train_dataset.height_norm_params
+
+        # Save to cache
+        with open(cache_file, 'w') as f:
+            json.dump(height_norm_params, f, indent=2)
+        print(f"Saved normalization params to {cache_file}")
 
     # Create val dataset with same normalization
     val_dataset = HeightEstimationDataset(

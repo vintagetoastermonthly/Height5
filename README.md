@@ -49,6 +49,8 @@ pytest tests/ -v
 
 ## Training
 
+**⚡ Performance Note:** For large datasets (1000+ clips), the first run computes normalization from a sample of 500 clips (~1-2 min) and caches it. Subsequent runs use the cache and start immediately. See [PERFORMANCE.md](PERFORMANCE.md) for details.
+
 Basic training:
 ```bash
 python src/train.py --data_dir data --batch_size 8
