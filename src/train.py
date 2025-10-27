@@ -15,7 +15,8 @@ from utils import (
     visualize_prediction,
     save_normalization_params,
     CSVLogger,
-    WarmupCosineScheduler
+    WarmupCosineScheduler,
+    combined_loss
 )
 
 
@@ -25,7 +26,8 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    epoch: int
+    epoch: int,
+    use_combined_loss: bool = True
 ) -> float:
     """Train for one epoch."""
     model.train()
@@ -41,7 +43,18 @@ def train_one_epoch(
         # Forward pass
         optimizer.zero_grad()
         prediction = model(images)
-        loss = criterion(prediction, target)
+
+        # Compute loss
+        if use_combined_loss:
+            loss, loss_dict = combined_loss(prediction, target)
+            pbar.set_postfix({
+                'loss': f'{loss.item():.6f}',
+                'l1': f'{loss_dict["l1"]:.4f}',
+                'grad': f'{loss_dict["gradient"]:.4f}'
+            })
+        else:
+            loss = criterion(prediction, target)
+            pbar.set_postfix({'loss': f'{loss.item():.6f}'})
 
         # Backward pass
         loss.backward()
@@ -50,8 +63,6 @@ def train_one_epoch(
         # Track metrics
         total_loss += loss.item()
         num_batches += 1
-
-        pbar.set_postfix({'loss': f'{loss.item():.6f}'})
 
     avg_loss = total_loss / num_batches
     return avg_loss
@@ -175,7 +186,8 @@ def train(args):
 
         # Train
         train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch
+            model, train_loader, criterion, optimizer, device, epoch,
+            use_combined_loss=True
         )
 
         # Validate

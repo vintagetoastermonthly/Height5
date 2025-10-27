@@ -53,6 +53,120 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> Dict[str, float
     }
 
 
+def gradient_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Compute gradient loss for edge preservation.
+
+    Uses Sobel filters to compute image gradients and compares them
+    between prediction and target. This encourages sharp edges and
+    better boundary preservation in height maps.
+
+    Args:
+        pred: (B, 1, H, W) predictions
+        target: (B, 1, H, W) targets
+
+    Returns:
+        Scalar gradient loss
+    """
+    # Sobel filters for gradient computation
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                           dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                           dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
+
+    # Compute gradients for prediction
+    pred_grad_x = torch.nn.functional.conv2d(pred, sobel_x, padding=1)
+    pred_grad_y = torch.nn.functional.conv2d(pred, sobel_y, padding=1)
+
+    # Compute gradients for target
+    target_grad_x = torch.nn.functional.conv2d(target, sobel_x, padding=1)
+    target_grad_y = torch.nn.functional.conv2d(target, sobel_y, padding=1)
+
+    # L1 loss on gradients
+    loss_x = torch.abs(pred_grad_x - target_grad_x).mean()
+    loss_y = torch.abs(pred_grad_y - target_grad_y).mean()
+
+    return loss_x + loss_y
+
+
+def multi_scale_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Compute multi-scale L1 loss at different resolutions.
+
+    Computes loss at original resolution and downsampled versions.
+    This encourages the model to get both large-scale structure and
+    fine-grained details correct.
+
+    Args:
+        pred: (B, 1, H, W) predictions
+        target: (B, 1, H, W) targets
+
+    Returns:
+        Weighted sum of losses at multiple scales
+    """
+    total_loss = 0.0
+    weights = [1.0, 0.5, 0.25]  # Weights for each scale
+    scales = [1.0, 0.5, 0.25]   # Scale factors
+
+    for weight, scale in zip(weights, scales):
+        if scale < 1.0:
+            # Downsample
+            pred_scaled = torch.nn.functional.interpolate(
+                pred, scale_factor=scale, mode='bilinear', align_corners=False
+            )
+            target_scaled = torch.nn.functional.interpolate(
+                target, scale_factor=scale, mode='bilinear', align_corners=False
+            )
+        else:
+            pred_scaled = pred
+            target_scaled = target
+
+        # L1 loss at this scale
+        loss = torch.abs(pred_scaled - target_scaled).mean()
+        total_loss += weight * loss
+
+    # Normalize by sum of weights
+    total_loss /= sum(weights)
+
+    return total_loss
+
+
+def combined_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    l1_weight: float = 1.0,
+    gradient_weight: float = 0.1,
+    multiscale_weight: float = 0.05
+) -> tuple[torch.Tensor, dict]:
+    """Compute combined loss with L1, gradient, and multi-scale components.
+
+    Args:
+        pred: (B, 1, H, W) predictions
+        target: (B, 1, H, W) targets
+        l1_weight: Weight for L1 loss
+        gradient_weight: Weight for gradient loss
+        multiscale_weight: Weight for multi-scale loss
+
+    Returns:
+        Tuple of (total_loss, loss_dict) where loss_dict contains individual losses
+    """
+    # Compute individual losses
+    l1 = torch.nn.functional.l1_loss(pred, target)
+    grad_loss = gradient_loss(pred, target)
+    ms_loss = multi_scale_loss(pred, target)
+
+    # Weighted combination
+    total = l1_weight * l1 + gradient_weight * grad_loss + multiscale_weight * ms_loss
+
+    # Return total and breakdown
+    loss_dict = {
+        'l1': l1.item(),
+        'gradient': grad_loss.item(),
+        'multiscale': ms_loss.item(),
+        'total': total.item()
+    }
+
+    return total, loss_dict
+
+
 def visualize_prediction(
     images: Dict[str, torch.Tensor],
     target: torch.Tensor,

@@ -23,6 +23,7 @@ class MultiViewEncoder(nn.Module):
         # Reduction convs: 1024 -> 256 channels (increased for richer context learning)
         self.reduce_layer3 = nn.Conv2d(1024, 256, kernel_size=1)
         self.reduce_layer2 = nn.Conv2d(512, 64, kernel_size=1)
+        self.reduce_layer1 = nn.Conv2d(256, 64, kernel_size=1)
 
         # Downsample from 16x16 to 8x8 (changed from stride=4 for better resolution)
         self.downsample = nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1)
@@ -50,7 +51,7 @@ class MultiViewEncoder(nn.Module):
         return encoder
 
     def forward_single(self, x: torch.Tensor, view: str) -> Dict[str, torch.Tensor]:
-        """Forward pass for a single view, return layer2 and layer3 features."""
+        """Forward pass for a single view, return layer1, layer2 and layer3 features."""
         encoder = self.encoders[view]
 
         x = encoder['conv1'](x)
@@ -58,11 +59,12 @@ class MultiViewEncoder(nn.Module):
         x = encoder['relu'](x)
         x = encoder['maxpool'](x)
 
-        x = encoder['layer1'](x)
-        layer2_feat = encoder['layer2'](x)  # (B, 512, 32, 32)
+        layer1_feat = encoder['layer1'](x)  # (B, 256, 64, 64)
+        layer2_feat = encoder['layer2'](layer1_feat)  # (B, 512, 32, 32)
         layer3_feat = encoder['layer3'](layer2_feat)  # (B, 1024, 16, 16)
 
         return {
+            'layer1': layer1_feat,
             'layer2': layer2_feat,
             'layer3': layer3_feat
         }
@@ -76,10 +78,12 @@ class MultiViewEncoder(nn.Module):
         Returns:
             Dict with:
                 - 'encoded_features': List of 5 tensors (B, 256, 8, 8)
-                - 'ortho_skip': (B, 64, 32, 32) skip connection from ortho layer2
+                - 'ortho_skip_layer2': (B, 64, 32, 32) skip connection from ortho layer2
+                - 'ortho_skip_layer1': (B, 64, 64, 64) skip connection from ortho layer1
         """
         # Process all views
         all_features = []
+        ortho_layer1 = None
         ortho_layer2 = None
 
         for view in ['ortho', 'north', 'south', 'east', 'west']:
@@ -90,16 +94,19 @@ class MultiViewEncoder(nn.Module):
             layer3 = self.downsample(layer3)  # (B, 256, 8, 8)
             all_features.append(layer3)
 
-            # Save ortho layer2 for skip connection
+            # Save ortho layers for skip connections
             if view == 'ortho':
+                ortho_layer1 = feats['layer1']
                 ortho_layer2 = feats['layer2']
 
-        # Process ortho skip connection - keep at full 32x32 resolution
-        ortho_skip = self.reduce_layer2(ortho_layer2)  # (B, 64, 32, 32)
+        # Process ortho skip connections - keep at full resolutions
+        ortho_skip_layer2 = self.reduce_layer2(ortho_layer2)  # (B, 64, 32, 32)
+        ortho_skip_layer1 = self.reduce_layer1(ortho_layer1)  # (B, 64, 64, 64)
 
         return {
             'encoded_features': all_features,  # List of 5 × (B, 256, 8, 8)
-            'ortho_skip': ortho_skip  # (B, 64, 32, 32)
+            'ortho_skip_layer2': ortho_skip_layer2,  # (B, 64, 32, 32)
+            'ortho_skip_layer1': ortho_skip_layer1   # (B, 64, 64, 64)
         }
 
 
@@ -180,10 +187,12 @@ class SubPixelUpsample(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Decoder with skip connections and sub-pixel upsampling.
+    """Decoder with dual skip connections and sub-pixel upsampling.
 
-    Emphasizes multi-view context (256 channels) over skip details (64 channels)
-    at the concatenation point.
+    Uses two skip connections:
+    - Layer2 skip at 32×32 for mid-level features (64 channels)
+    - Layer1 skip at 64×64 for high-resolution details (64 channels)
+    Emphasizes multi-view context (256 channels) over skip details.
     """
 
     def __init__(self):
@@ -195,7 +204,7 @@ class Decoder(nn.Module):
         # Second upsample: 16x16x256 -> 32x32x256
         self.upsample2 = SubPixelUpsample(256, 256, scale_factor=2)
 
-        # Conv block after skip connection concatenation at 32x32
+        # Conv block after layer2 skip connection concatenation at 32x32
         # 256 context channels + 64 skip channels = 320 total
         self.conv_block1 = nn.Sequential(
             nn.Conv2d(320, 256, kernel_size=3, padding=1),
@@ -206,17 +215,30 @@ class Decoder(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Third upsample: 32x32x128 -> 64x64x64
-        self.upsample3 = SubPixelUpsample(128, 64, scale_factor=2)
+        # Third upsample: 32x32x128 -> 64x64x128
+        self.upsample3 = SubPixelUpsample(128, 128, scale_factor=2)
+
+        # Conv block after layer1 skip connection concatenation at 64x64
+        # 128 upsampled channels + 64 layer1 skip channels = 192 total
+        self.conv_block2 = nn.Sequential(
+            nn.Conv2d(192, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
 
         # Final conv to output
         self.final_conv = nn.Conv2d(64, 1, kernel_size=3, padding=1)
 
-    def forward(self, fused: torch.Tensor, ortho_skip: torch.Tensor) -> torch.Tensor:
+    def forward(self, fused: torch.Tensor, ortho_skip_layer2: torch.Tensor,
+                ortho_skip_layer1: torch.Tensor) -> torch.Tensor:
         """
         Args:
             fused: (B, 256, 8, 8) fused features with rich multi-view context
-            ortho_skip: (B, 64, 32, 32) skip connection from ortho
+            ortho_skip_layer2: (B, 64, 32, 32) skip from ortho layer2
+            ortho_skip_layer1: (B, 64, 64, 64) skip from ortho layer1
 
         Returns:
             output: (B, 1, 64, 64) height map
@@ -227,15 +249,20 @@ class Decoder(nn.Module):
         # Upsample to 32x32, maintaining 256 context channels
         x = self.upsample2(x)  # (B, 256, 32, 32)
 
-        # Concatenate with skip connection at 32x32
-        # Emphasizes context (256) over skip details (64)
-        x = torch.cat([x, ortho_skip], dim=1)  # (B, 320, 32, 32)
+        # Concatenate with layer2 skip connection at 32x32
+        x = torch.cat([x, ortho_skip_layer2], dim=1)  # (B, 320, 32, 32)
 
         # Process with conv block
         x = self.conv_block1(x)  # (B, 128, 32, 32)
 
         # Upsample to 64x64
-        x = self.upsample3(x)  # (B, 64, 64, 64)
+        x = self.upsample3(x)  # (B, 128, 64, 64)
+
+        # Concatenate with layer1 skip connection at 64x64
+        x = torch.cat([x, ortho_skip_layer1], dim=1)  # (B, 192, 64, 64)
+
+        # Process with conv block
+        x = self.conv_block2(x)  # (B, 64, 64, 64)
 
         # Final conv to height map
         output = self.final_conv(x)  # (B, 1, 64, 64)
@@ -265,13 +292,14 @@ class HeightEstimationModel(nn.Module):
         # Encode all views
         encoder_out = self.encoder(images)
         encoded_features = encoder_out['encoded_features']
-        ortho_skip = encoder_out['ortho_skip']
+        ortho_skip_layer2 = encoder_out['ortho_skip_layer2']
+        ortho_skip_layer1 = encoder_out['ortho_skip_layer1']
 
         # Fuse features with cross-attention
         fused = self.fusion(encoded_features)
 
-        # Decode to height map
-        height_map = self.decoder(fused, ortho_skip)
+        # Decode to height map with dual skip connections
+        height_map = self.decoder(fused, ortho_skip_layer2, ortho_skip_layer1)
 
         return height_map
 
