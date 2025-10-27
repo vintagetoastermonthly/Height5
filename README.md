@@ -89,20 +89,92 @@ Best model visualizations are saved to `examples/` after each improvement.
 
 ## Model Architecture
 
-- **Encoder**: 5× ResNet50 (ImageNet pretrained)
-  - Input: 256×256×3 RGB per view
-  - Features: 4×4×64 per view
+Multi-view height estimation with **256×256 input → 64×64 output** using cross-attention fusion.
 
-- **Fusion**: Cross-attention
-  - Ortho queries oblique features
-  - Output: 4×4×64 fused features
+### Architecture Overview
 
-- **Decoder**: U-Net style with skip connections
-  - Skip from ortho layer2: 16×16×64
-  - Output: 32×32×1 height map
+The model emphasizes **rich multi-view context learning (256 channels)** over skip connection details (64 channels), with a 4:1 ratio at concatenation.
 
-- **Total parameters**: ~44M (5 partial ResNet50 encoders)
-- **Memory**: ~6-8GB VRAM at batch_size=4
+### Detailed Flow
+
+#### 1. Encoder: Processing Each View (5× in parallel)
+
+Each of the 5 views (ortho + 4 obliques) goes through **identical ResNet50 encoders**:
+
+```
+256×256×3 RGB input
+   ↓ ResNet50 conv1 + bn + relu + maxpool
+64×64×64
+   ↓ ResNet50 layer1
+64×64×256
+   ↓ ResNet50 layer2 (stride=2)
+32×32×512  ← SAVED for skip connection (ortho only)
+   ↓ ResNet50 layer3 (stride=2)
+16×16×1024
+   ↓ 1×1 conv: reduce channels (1024→256)
+16×16×256
+   ↓ 3×3 conv: spatial downsample (stride=2)
+8×8×256  ← READY FOR FUSION
+```
+
+**Result:** All 5 views at **8×8×256** with equal representation.
+
+#### 2. Cross-Attention Fusion: Combining Multi-View Information
+
+**Input:** 5 feature maps (B, 256, 8, 8) - ortho, north, south, east, west
+
+**Fusion mechanism:**
+1. Flatten each view: (B, 256, 8, 8) → (B, 64, 256) where 64 = 8×8 positions
+2. Total: 5 views × 64 positions = **320 spatial positions**
+3. Cross-attention setup:
+   - **Queries (Q):** Ortho features (B, 64, 256)
+   - **Keys/Values (K, V):** All views concatenated (B, 320, 256)
+4. For each of 64 ortho positions, attention weights determine relevant information across all 320 positions
+5. Output: Fused features (B, 256, 8, 8)
+
+**Key insight:** Each output position "attends" to all 5 views, weighting information by relevance. If the north oblique clearly shows a building edge, attention weights it higher for those positions.
+
+#### 3. Skip Connection: High-Resolution Detail from Ortho
+
+```
+Ortho layer2: 32×32×512 (from ResNet50 encoder)
+   ↓ 1×1 conv: reduce channels (512→64)
+32×32×64  ← SKIP CONNECTION
+```
+
+Preserved at full 32×32 resolution (1,024 spatial positions).
+
+#### 4. Decoder: Upsampling with Skip Integration
+
+```
+8×8×256 (fused multi-view context)
+   ↓ SubPixelUpsample (2×)
+16×16×256 (maintaining rich context)
+   ↓ SubPixelUpsample (2×)
+32×32×256 (maintaining rich context)
+   ↓ Concatenate with skip
+32×32×320 (256 context + 64 skip = 4:1 emphasis)
+   ↓ Conv block (2× conv3×3 + BN + ReLU)
+32×32×128
+   ↓ SubPixelUpsample (2×)
+64×64×64
+   ↓ Final conv3×3
+64×64×1 (height map output)
+```
+
+**Design rationale:** The upsampled features (8×8→32×32) contain semantic understanding from multi-view fusion, while skip connection provides fine-grained spatial details. Concatenating at 32×32 allows the decoder to:
+- Use semantic info to understand "what" is present (building, tree, ground)
+- Use skip details to precisely locate "where" edges and boundaries are
+- Upsample once more (32×32→64×64) with combined information
+
+### Architecture Specifications
+
+- **Total parameters**: ~50M
+- **Memory**: ~6-8GB VRAM at batch_size=8
+- **Context channels**: 256 (emphasizes multi-view learning)
+- **Skip channels**: 64 (lightweight spatial refinement)
+- **Fusion resolution**: 8×8 with 64 spatial positions
+- **Output resolution**: 64×64 (4× more detail than initial 32×32 design)
 
 ## Inference
 
@@ -153,14 +225,14 @@ This creates 20 property clips (120 files total) with:
 
 ## Notes
 
-- Resolution limited to 256→32 for memory constraints
-- Output at 32×32 is 8× downsampling from input
+- Resolution: 256×256 input → 64×64 output (4× downsampling)
 - **DSM grounding**: Each DSM is grounded to 0m by subtracting its 2nd percentile
   - Removes absolute elevation offset (e.g., sea level vs mountain scenes)
   - Model learns relative heights (buildings, trees, terrain) not absolute elevations
   - Critical for handling mixed datasets with varied base elevations
-- L1 loss used (robust to outliers at low resolution)
+- L1 loss used (MAE - robust to outliers)
 - Cosine annealing LR schedule with linear warmup
 - Early stopping prevents overfitting
 - No augmentation (maintains 5-view alignment)
-- ~44M parameters (5 partial ResNet50 encoders up to layer3)
+- ~50M parameters (5 partial ResNet50 encoders + cross-attention + decoder)
+- Fast dataloader: optimized for WSL2 with single `os.listdir()` vs multiple glob operations

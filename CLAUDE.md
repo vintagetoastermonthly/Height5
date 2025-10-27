@@ -10,31 +10,38 @@ Height estimation machine learning model for aerial imagery using PyTorch. The m
 
 **Multi-branch encoder with cross-attention fusion:**
 - 5 ResNet50 backbones (ImageNet pre-trained) - one per input image
-- Memory-constrained design: 256x256 input → 32x32 output (8x downsampling)
+- Design: 256×256 input → 64×64 output (4× downsampling)
 - Cross-attention fusion using ortho as anchor for querying oblique features
 - U-Net style decoder with skip connections and sub-pixel convolution upsampling
+- **Emphasis**: Rich multi-view context (256 channels) over skip details (64 channels), 4:1 ratio
 
 **Detailed flow:**
-1. **Encoder (per image):**
-   - Input: 256x256x3 RGB (normalized to [0,1])
-   - ResNet50 layer3 features: 32x32x1024
-   - 1x1 conv reduce to: 32x32x64
-   - Strided conv downsample to: 8x8x64
-   - Output: 5×(batch, 8, 8, 64)
+1. **Encoder (per image - 5× parallel):**
+   - Input: 256×256×3 RGB (normalized to [0,1])
+   - ResNet50 through layer2: 32×32×512 (saved for skip, ortho only)
+   - ResNet50 layer3: 16×16×1024
+   - 1×1 conv reduce to: 16×16×256
+   - Strided conv (stride=2) downsample to: 8×8×256
+   - Output: 5×(batch, 8, 8, 256)
 
 2. **Fusion via cross-attention:**
-   - Flatten spatial: 5×(batch, 64, 64) where 64 features × 64 positions
-   - Cross-attention: ortho as queries, all 5 views as keys/values
-   - Output: (batch, 64, 64) fused features
-   - Re-spatialize to: (batch, 8, 8, 64)
+   - Flatten spatial: 5×(batch, 64, 256) where 64 = 8×8 positions
+   - Total: 320 spatial positions (5 views × 64)
+   - Cross-attention: ortho as queries (B, 64, 256), all 5 views as keys/values (B, 320, 256)
+   - Output: (batch, 64, 256) fused features
+   - Re-spatialize to: (batch, 8, 8, 256)
 
-3. **Decoder:**
-   - Upsample to (batch, 16, 16, 128) via sub-pixel convolution
-   - Skip connection: ortho ResNet50 layer2 (batch, 32, 32, 512) → 1x1 conv to (batch, 32, 32, 64) → downsample to (batch, 16, 16, 64)
-   - Concatenate: (batch, 16, 16, 192)
-   - Conv block with residual connections
-   - Upsample to (batch, 32, 32, 64) via sub-pixel convolution
-   - Final 3x3 conv to (batch, 32, 32, 1) height output
+3. **Skip connection (ortho only):**
+   - Ortho ResNet50 layer2: 32×32×512
+   - 1×1 conv reduce to: 32×32×64 (preserved at full resolution)
+
+4. **Decoder:**
+   - Upsample to (batch, 16, 16, 256) via sub-pixel convolution
+   - Upsample to (batch, 32, 32, 256) via sub-pixel convolution
+   - Concatenate with skip: (batch, 32, 32, 320) = 256 context + 64 skip
+   - Conv block: (batch, 32, 32, 128)
+   - Upsample to (batch, 64, 64, 64) via sub-pixel convolution
+   - Final 3×3 conv to (batch, 64, 64, 1) height output
 
 ## Data Structure
 
@@ -55,7 +62,7 @@ Height estimation machine learning model for aerial imagery using PyTorch. The m
   - Verify bit depth (16-bit preferred)
   - Normalize to [0, 1] using 99th percentile of grounded heights
 - Store normalization parameters for inference denormalization
-- Resample targets to 32x32x1 using bilinear interpolation
+- Resample targets to 64×64×1 using bilinear interpolation
 - Train/validation split: validation where `clip % 5 == 0`
 - No augmentation initially (to maintain 5-view alignment)
 
@@ -82,15 +89,25 @@ Height estimation machine learning model for aerial imagery using PyTorch. The m
 
 ## Implementation Notes
 
-**Memory constraints:**
-- Resolution limited to 256→32 to manage GPU memory with 5× ResNet50 encoders
-- Expected memory usage: ~6-8GB VRAM with batch_size=4
-- If OOM errors occur: reduce batch size to 2 or use gradient checkpointing
+**Memory and performance:**
+- Resolution: 256×256 input → 64×64 output (4× downsampling)
+- Expected memory usage: ~6-8GB VRAM with batch_size=8
+- If OOM errors occur: reduce batch size to 4 or 2
+- **Fast dataloader**: Optimized for WSL2/slow filesystems
+  - Uses single `os.listdir()` instead of ~1000 glob operations
+  - Startup time: <1 second for 5000 clips vs 15+ minutes with glob
+  - Critical optimization for development workflow
+
+**Model specifications:**
+- Total parameters: ~50M
+- Context channels at fusion: 256 (rich multi-view learning)
+- Skip channels: 64 (lightweight spatial refinement)
+- Cross-attention operates on 320 positions (5 views × 64 spatial)
 
 **Key implementation priorities:**
-1. Data loader with proper file matching and validation split
+1. Data loader with optimized file matching (single listdir) and validation split
 2. Model architecture with pre-trained ResNet50 backbones
-3. Cross-attention fusion module
+3. Cross-attention fusion module (256-dimensional features)
 4. Training loop with checkpointing and visualization
 5. Height normalization/denormalization utilities
 

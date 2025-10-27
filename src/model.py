@@ -20,12 +20,12 @@ class MultiViewEncoder(nn.Module):
             'west': self._create_resnet_encoder(pretrained),
         })
 
-        # Reduction convs: 1024 -> 64 channels
-        self.reduce_layer3 = nn.Conv2d(1024, 64, kernel_size=1)
+        # Reduction convs: 1024 -> 256 channels (increased for richer context learning)
+        self.reduce_layer3 = nn.Conv2d(1024, 256, kernel_size=1)
         self.reduce_layer2 = nn.Conv2d(512, 64, kernel_size=1)
 
-        # Downsample from 32x32 to 8x8
-        self.downsample = nn.Conv2d(64, 64, kernel_size=3, stride=4, padding=1)
+        # Downsample from 16x16 to 8x8 (changed from stride=4 for better resolution)
+        self.downsample = nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1)
 
     def _create_resnet_encoder(self, pretrained: bool):
         """Create ResNet50 encoder and extract intermediate layers."""
@@ -75,8 +75,8 @@ class MultiViewEncoder(nn.Module):
 
         Returns:
             Dict with:
-                - 'encoded_features': List of 5 tensors (B, 64, 4, 4)
-                - 'ortho_skip': (B, 64, 16, 16) skip connection from ortho layer2
+                - 'encoded_features': List of 5 tensors (B, 256, 8, 8)
+                - 'ortho_skip': (B, 64, 32, 32) skip connection from ortho layer2
         """
         # Process all views
         all_features = []
@@ -86,21 +86,20 @@ class MultiViewEncoder(nn.Module):
             feats = self.forward_single(images[view], view)
 
             # Extract and reduce layer3 features
-            layer3 = self.reduce_layer3(feats['layer3'])  # (B, 64, 16, 16)
-            layer3 = self.downsample(layer3)  # (B, 64, 4, 4)
+            layer3 = self.reduce_layer3(feats['layer3'])  # (B, 256, 16, 16)
+            layer3 = self.downsample(layer3)  # (B, 256, 8, 8)
             all_features.append(layer3)
 
             # Save ortho layer2 for skip connection
             if view == 'ortho':
                 ortho_layer2 = feats['layer2']
 
-        # Process ortho skip connection
+        # Process ortho skip connection - keep at full 32x32 resolution
         ortho_skip = self.reduce_layer2(ortho_layer2)  # (B, 64, 32, 32)
-        ortho_skip = F.avg_pool2d(ortho_skip, kernel_size=2)  # (B, 64, 16, 16)
 
         return {
-            'encoded_features': all_features,  # List of 5 × (B, 64, 4, 4)
-            'ortho_skip': ortho_skip  # (B, 64, 16, 16)
+            'encoded_features': all_features,  # List of 5 × (B, 256, 8, 8)
+            'ortho_skip': ortho_skip  # (B, 64, 32, 32)
         }
 
 
@@ -124,11 +123,11 @@ class CrossAttentionFusion(nn.Module):
     def forward(self, features_list: List[torch.Tensor]) -> torch.Tensor:
         """
         Args:
-            features_list: List of 5 tensors, each (B, 64, 4, 4)
+            features_list: List of 5 tensors, each (B, 256, 8, 8)
                           [ortho, north, south, east, west]
 
         Returns:
-            Fused features: (B, 64, 4, 4)
+            Fused features: (B, 256, 8, 8)
         """
         B = features_list[0].shape[0]
         _, C, H, W = features_list[0].shape
@@ -140,20 +139,20 @@ class CrossAttentionFusion(nn.Module):
             flattened.append(feat_flat)
 
         # Ortho as query, all views as key/value
-        ortho_query = flattened[0]  # (B, 16, 64)
-        all_kv = torch.cat(flattened, dim=1)  # (B, 80, 64) where 80 = 5*16
+        ortho_query = flattened[0]  # (B, 64, 256)
+        all_kv = torch.cat(flattened, dim=1)  # (B, 320, 256) where 320 = 5*64
 
         # Cross-attention
         fused, _ = self.cross_attention(
             query=ortho_query,
             key=all_kv,
             value=all_kv
-        )  # (B, 16, 64)
+        )  # (B, 64, 256)
 
         # Residual connection
         fused = self.norm(fused + ortho_query)
 
-        # Reshape back to spatial: (B, 16, 64) -> (B, 64, 4, 4)
+        # Reshape back to spatial: (B, 64, 256) -> (B, 256, 8, 8)
         fused = fused.permute(0, 2, 1).reshape(B, self.feature_dim, H, W)
 
         return fused
@@ -181,59 +180,65 @@ class SubPixelUpsample(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Decoder with skip connections and sub-pixel upsampling."""
+    """Decoder with skip connections and sub-pixel upsampling.
+
+    Emphasizes multi-view context (256 channels) over skip details (64 channels)
+    at the concatenation point.
+    """
 
     def __init__(self):
         super().__init__()
 
-        # First upsample: 4x4x64 -> 8x8x128
-        self.upsample1 = SubPixelUpsample(64, 128, scale_factor=2)
+        # First upsample: 8x8x256 -> 16x16x256
+        self.upsample1 = SubPixelUpsample(256, 256, scale_factor=2)
 
-        # Second upsample: 8x8x128 -> 16x16x64
-        self.upsample2 = SubPixelUpsample(128, 64, scale_factor=2)
+        # Second upsample: 16x16x256 -> 32x32x256
+        self.upsample2 = SubPixelUpsample(256, 256, scale_factor=2)
 
-        # Conv block after skip connection concatenation
+        # Conv block after skip connection concatenation at 32x32
+        # 256 context channels + 64 skip channels = 320 total
         self.conv_block1 = nn.Sequential(
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),  # 64 + 64 skip = 128
-            nn.BatchNorm2d(128),
+            nn.Conv2d(320, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
 
-        # Third upsample: 16x16x64 -> 32x32x32
-        self.upsample3 = SubPixelUpsample(64, 32, scale_factor=2)
+        # Third upsample: 32x32x128 -> 64x64x64
+        self.upsample3 = SubPixelUpsample(128, 64, scale_factor=2)
 
         # Final conv to output
-        self.final_conv = nn.Conv2d(32, 1, kernel_size=3, padding=1)
+        self.final_conv = nn.Conv2d(64, 1, kernel_size=3, padding=1)
 
     def forward(self, fused: torch.Tensor, ortho_skip: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            fused: (B, 64, 4, 4) fused features
-            ortho_skip: (B, 64, 16, 16) skip connection from ortho
+            fused: (B, 256, 8, 8) fused features with rich multi-view context
+            ortho_skip: (B, 64, 32, 32) skip connection from ortho
 
         Returns:
-            output: (B, 1, 32, 32) height map
+            output: (B, 1, 64, 64) height map
         """
-        # Upsample to 8x8
-        x = self.upsample1(fused)  # (B, 128, 8, 8)
+        # Upsample to 16x16, maintaining 256 context channels
+        x = self.upsample1(fused)  # (B, 256, 16, 16)
 
-        # Upsample to 16x16
-        x = self.upsample2(x)  # (B, 64, 16, 16)
+        # Upsample to 32x32, maintaining 256 context channels
+        x = self.upsample2(x)  # (B, 256, 32, 32)
 
-        # Concatenate with skip connection
-        x = torch.cat([x, ortho_skip], dim=1)  # (B, 128, 16, 16)
+        # Concatenate with skip connection at 32x32
+        # Emphasizes context (256) over skip details (64)
+        x = torch.cat([x, ortho_skip], dim=1)  # (B, 320, 32, 32)
 
         # Process with conv block
-        x = self.conv_block1(x)  # (B, 64, 16, 16)
+        x = self.conv_block1(x)  # (B, 128, 32, 32)
 
-        # Upsample to 32x32
-        x = self.upsample3(x)  # (B, 32, 32, 32)
+        # Upsample to 64x64
+        x = self.upsample3(x)  # (B, 64, 64, 64)
 
         # Final conv to height map
-        output = self.final_conv(x)  # (B, 1, 32, 32)
+        output = self.final_conv(x)  # (B, 1, 64, 64)
 
         return output
 
@@ -245,7 +250,7 @@ class HeightEstimationModel(nn.Module):
         super().__init__()
 
         self.encoder = MultiViewEncoder(pretrained=pretrained)
-        self.fusion = CrossAttentionFusion(feature_dim=64, num_heads=8)
+        self.fusion = CrossAttentionFusion(feature_dim=256, num_heads=8)
         self.decoder = Decoder()
 
     def forward(self, images: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -255,7 +260,7 @@ class HeightEstimationModel(nn.Module):
                     Each value is (B, 3, 256, 256)
 
         Returns:
-            height_map: (B, 1, 32, 32) predicted height map
+            height_map: (B, 1, 64, 64) predicted height map
         """
         # Encode all views
         encoder_out = self.encoder(images)
@@ -288,7 +293,7 @@ if __name__ == '__main__':
     # Forward pass
     output = model(dummy_images)
     print(f"Output shape: {output.shape}")
-    print(f"Expected: ({batch_size}, 1, 32, 32)")
+    print(f"Expected: ({batch_size}, 1, 64, 64)")
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())

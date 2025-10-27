@@ -162,13 +162,13 @@ class HeightEstimationDataset(Dataset):
         img = torch.from_numpy(img).permute(2, 0, 1)  # HWC -> CHW
         return img
 
-    def _load_and_preprocess_dsm(self, path: str, size: Tuple[int, int] = (32, 32)) -> torch.Tensor:
+    def _load_and_preprocess_dsm(self, path: str, size: Tuple[int, int] = (64, 64)) -> torch.Tensor:
         """Load DSM and preprocess to tensor.
 
         Steps:
         1. Load raw DSM
         2. Ground to 0m by subtracting 2nd percentile (removes absolute elevation offset)
-        3. Resize to target size
+        3. Resize to target size (64x64 for higher resolution output)
         4. Normalize to [0, 1] using dataset statistics
         """
         dsm = Image.open(path)
@@ -200,7 +200,7 @@ class HeightEstimationDataset(Dataset):
         Returns:
             images: Dict with keys 'ortho', 'north', 'south', 'east', 'west'
                     Each value is a (3, 256, 256) tensor
-            target: (1, 32, 32) tensor with normalized heights
+            target: (1, 64, 64) tensor with normalized heights
         """
         clip = self.clips[idx]
 
