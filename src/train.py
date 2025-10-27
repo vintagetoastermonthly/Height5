@@ -46,11 +46,13 @@ def train_one_epoch(
 
         # Compute loss
         if use_combined_loss:
-            loss, loss_dict = combined_loss(prediction, target)
+            # Pass ortho image for edge-aware smoothness
+            loss, loss_dict = combined_loss(prediction, target, image=images['ortho'])
             pbar.set_postfix({
                 'loss': f'{loss.item():.6f}',
-                'l1': f'{loss_dict["l1"]:.4f}',
-                'grad': f'{loss_dict["gradient"]:.4f}'
+                'huber': f'{loss_dict["huber"]:.4f}',
+                'grad': f'{loss_dict["gradient"]:.4f}',
+                'smooth': f'{loss_dict["smoothness"]:.4f}'
             })
         else:
             loss = criterion(prediction, target)

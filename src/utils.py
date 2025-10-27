@@ -129,40 +129,104 @@ def multi_scale_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return total_loss
 
 
+def edge_aware_smoothness_loss(
+    pred: torch.Tensor,
+    image: torch.Tensor
+) -> torch.Tensor:
+    """Compute edge-aware smoothness loss.
+
+    Penalizes rough predictions in smooth image regions, but allows sharp
+    discontinuities where there are edges in the input image.
+
+    Args:
+        pred: (B, 1, H, W) predicted height map
+        image: (B, 3, H_img, W_img) input RGB image (guides where edges are)
+
+    Returns:
+        Scalar smoothness loss that respects image edges
+    """
+    # Resize image to match prediction resolution if needed
+    if image.shape[2:] != pred.shape[2:]:
+        image = torch.nn.functional.interpolate(
+            image, size=pred.shape[2:], mode='bilinear', align_corners=False
+        )
+
+    # Compute height gradients (how much height changes)
+    pred_grad_x = pred[:, :, :, :-1] - pred[:, :, :, 1:]  # (B, 1, H, W-1)
+    pred_grad_y = pred[:, :, :-1, :] - pred[:, :, 1:, :]  # (B, 1, H-1, W)
+
+    # Compute image gradients (where are edges in RGB?)
+    # Take mean across RGB channels
+    image_grad_x = torch.mean(
+        torch.abs(image[:, :, :, :-1] - image[:, :, :, 1:]),
+        dim=1, keepdim=True
+    )  # (B, 1, H, W-1)
+    image_grad_y = torch.mean(
+        torch.abs(image[:, :, :-1, :] - image[:, :, 1:, :]),
+        dim=1, keepdim=True
+    )  # (B, 1, H-1, W)
+
+    # Weight height gradients by inverse of image gradients
+    # Where image has edges (large grad) → small weight → allows height discontinuity
+    # Where image is smooth (small grad) → large weight → penalizes height variation
+    weight_x = torch.exp(-image_grad_x)  # Range: (0, 1], high where image is smooth
+    weight_y = torch.exp(-image_grad_y)
+
+    # Penalize weighted height gradients
+    loss_x = torch.mean(weight_x * torch.abs(pred_grad_x))
+    loss_y = torch.mean(weight_y * torch.abs(pred_grad_y))
+
+    return loss_x + loss_y
+
+
 def combined_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
-    l1_weight: float = 1.0,
+    image: torch.Tensor = None,
+    huber_weight: float = 1.0,
     gradient_weight: float = 0.1,
-    multiscale_weight: float = 0.05
+    multiscale_weight: float = 0.15,
+    smoothness_weight: float = 0.05,
+    huber_beta: float = 1.0
 ) -> tuple[torch.Tensor, dict]:
-    """Compute combined loss with L1, gradient, and multi-scale components.
+    """Compute combined loss with Huber, gradient, multi-scale, and smoothness components.
 
     Args:
         pred: (B, 1, H, W) predictions
         target: (B, 1, H, W) targets
-        l1_weight: Weight for L1 loss
-        gradient_weight: Weight for gradient loss
-        multiscale_weight: Weight for multi-scale loss
+        image: (B, 3, H, W) input RGB image for edge-aware smoothness (optional)
+        huber_weight: Weight for Huber loss (primary loss)
+        gradient_weight: Weight for gradient loss (edge preservation)
+        multiscale_weight: Weight for multi-scale loss (structure)
+        smoothness_weight: Weight for edge-aware smoothness (regularization)
+        huber_beta: Beta parameter for Huber loss (transition point, default=1.0)
 
     Returns:
         Tuple of (total_loss, loss_dict) where loss_dict contains individual losses
     """
     # Compute individual losses
-    l1 = torch.nn.functional.l1_loss(pred, target)
+    huber = torch.nn.functional.smooth_l1_loss(pred, target, beta=huber_beta)
     grad_loss = gradient_loss(pred, target)
     ms_loss = multi_scale_loss(pred, target)
 
     # Weighted combination
-    total = l1_weight * l1 + gradient_weight * grad_loss + multiscale_weight * ms_loss
+    total = huber_weight * huber + gradient_weight * grad_loss + multiscale_weight * ms_loss
 
-    # Return total and breakdown
+    # Add edge-aware smoothness if image provided
     loss_dict = {
-        'l1': l1.item(),
+        'huber': huber.item(),
         'gradient': grad_loss.item(),
-        'multiscale': ms_loss.item(),
-        'total': total.item()
+        'multiscale': ms_loss.item()
     }
+
+    if image is not None and smoothness_weight > 0:
+        smooth_loss = edge_aware_smoothness_loss(pred, image)
+        total = total + smoothness_weight * smooth_loss
+        loss_dict['smoothness'] = smooth_loss.item()
+    else:
+        loss_dict['smoothness'] = 0.0
+
+    loss_dict['total'] = total.item()
 
     return total, loss_dict
 

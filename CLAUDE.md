@@ -69,9 +69,14 @@ Height estimation machine learning model for aerial imagery using PyTorch. The m
 ## Training Configuration
 
 **Loss and metrics:**
-- Primary loss: L1 (MAE) - robust to outliers at low resolution
+- Combined loss function with 4 components:
+  1. **Huber loss** (weight=1.0): Primary loss, robust to outliers with smooth transition (beta=1.0)
+  2. **Gradient loss** (weight=0.1): Preserves sharp edges using Sobel filters
+  3. **Multi-scale loss** (weight=0.15): Ensures correct structure at multiple resolutions (1.0, 0.5, 0.25)
+  4. **Edge-aware smoothness** (weight=0.05): Reduces noise in flat regions while preserving edges
 - Evaluation metrics: L1, RMSE, median absolute error
-- Optional future enhancement: Add 0.1 × gradient loss for edge preservation
+- The Huber loss transitions from quadratic (L2-like) for small errors to linear (L1-like) for large errors
+- Edge-aware smoothness uses ortho RGB to guide where height should be smooth vs discontinuous
 
 **Optimizer and schedule:**
 - AdamW optimizer, weight_decay=0.01

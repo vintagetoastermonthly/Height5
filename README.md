@@ -230,9 +230,9 @@ This creates 20 property clips (120 files total) with:
   - Removes absolute elevation offset (e.g., sea level vs mountain scenes)
   - Model learns relative heights (buildings, trees, terrain) not absolute elevations
   - Critical for handling mixed datasets with varied base elevations
-- L1 loss used (MAE - robust to outliers)
+- Combined loss: Huber (primary) + gradient + multi-scale + edge-aware smoothness
 - Cosine annealing LR schedule with linear warmup
 - Early stopping prevents overfitting
-- No augmentation (maintains 5-view alignment)
+- Augmentation: Rotation (90° increments) + image dropout (10% per view)
 - ~50M parameters (5 partial ResNet50 encoders + cross-attention + decoder)
 - Fast dataloader: optimized for WSL2 with single `os.listdir()` vs multiple glob operations
