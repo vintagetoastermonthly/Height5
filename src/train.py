@@ -117,7 +117,9 @@ def train(args):
     train_loader, val_loader, height_norm_params = create_dataloaders(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        augment=args.augment,
+        drop_prob=args.drop_prob
     )
 
     # Save normalization parameters
@@ -276,6 +278,10 @@ if __name__ == '__main__':
                         help='Batch size (reduce if OOM)')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of data loading workers')
+    parser.add_argument('--augment', action='store_true', default=False,
+                        help='Enable rotation augmentation (90° increments)')
+    parser.add_argument('--drop_prob', type=float, default=0.0,
+                        help='Probability of dropping each input image (0.0-1.0, default: 0.0)')
 
     # Model
     parser.add_argument('--pretrained', action='store_true', default=True,

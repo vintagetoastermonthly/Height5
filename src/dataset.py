@@ -24,7 +24,9 @@ class HeightEstimationDataset(Dataset):
         data_dir: str,
         split: str = 'train',
         height_norm_params: Optional[Dict[str, float]] = None,
-        compute_norm_params: bool = False
+        compute_norm_params: bool = False,
+        augment: bool = False,
+        drop_prob: float = 0.0
     ):
         """
         Args:
@@ -32,9 +34,13 @@ class HeightEstimationDataset(Dataset):
             split: 'train' or 'val' (validation uses clip % 5 == 0)
             height_norm_params: Dict with 'min' and 'max' for height normalization
             compute_norm_params: If True, compute and store normalization params
+            augment: If True, apply rotation augmentation (only for training split)
+            drop_prob: Probability of dropping each input image (0.0-1.0, only for training)
         """
         self.data_dir = Path(data_dir)
         self.split = split
+        self.augment = augment and (split == 'train')  # Only augment training data
+        self.drop_prob = drop_prob if split == 'train' else 0.0  # Only drop in training
 
         # Find all valid clips (those with all 6 files)
         self.clips = self._find_valid_clips()
@@ -48,6 +54,10 @@ class HeightEstimationDataset(Dataset):
             raise ValueError(f"Split must be 'train' or 'val', got {split}")
 
         print(f"{split.upper()} set: {len(self.clips)} clips")
+        if self.augment:
+            print("  Augmentation: Enabled (90° rotations)")
+        if self.drop_prob > 0:
+            print(f"  Image dropout: Enabled ({self.drop_prob*100:.0f}% per image)")
 
         # Height normalization
         if compute_norm_params:
@@ -192,6 +202,120 @@ class HeightEstimationDataset(Dataset):
         dsm = torch.from_numpy(dsm).unsqueeze(0)  # Add channel dimension
         return dsm
 
+    def _remap_obliques_for_rotation(
+        self,
+        images: Dict[str, torch.Tensor],
+        k: int
+    ) -> Dict[str, torch.Tensor]:
+        """Remap oblique dictionary keys after rotation.
+
+        When rotating the scene by k*90° clockwise, the oblique views shift:
+        - k=1 (90° CW):  north→east, east→south, south→west, west→north
+        - k=2 (180°):    north→south, east→west, south→north, west→east
+        - k=3 (270° CW): north→west, east→north, south→east, west→south
+
+        Args:
+            images: Dict with keys 'ortho', 'north', 'south', 'east', 'west'
+            k: Number of 90° clockwise rotations (0, 1, 2, or 3)
+
+        Returns:
+            Dict with remapped oblique keys
+        """
+        if k == 0:
+            return images
+
+        # Define rotation mappings: old_direction → new_direction
+        # When scene rotates CW, north→east means: old north view is now from east
+        forward_mapping = {
+            1: {'north': 'east', 'east': 'south', 'south': 'west', 'west': 'north'},
+            2: {'north': 'south', 'east': 'west', 'south': 'north', 'west': 'east'},
+            3: {'north': 'west', 'east': 'north', 'south': 'east', 'west': 'south'},
+        }
+
+        # Invert the mapping: to fill new position X, use old position Y
+        # If north→east, then to get new north, we need old west (because west→north)
+        inverse_mapping = {v: k for k, v in forward_mapping[k].items()}
+
+        # Create new dict with remapped obliques (ortho stays as 'ortho')
+        # For each new direction, get the content from the old direction
+        remapped = {'ortho': images['ortho']}
+        for new_dir, old_dir in inverse_mapping.items():
+            remapped[new_dir] = images[old_dir]
+
+        return remapped
+
+    def _apply_rotation_augmentation(
+        self,
+        images: Dict[str, torch.Tensor],
+        target: torch.Tensor
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        """Apply random 90° rotation augmentation to all images and target.
+
+        Randomly rotates by 0°, 90°, 180°, or 270° (clockwise).
+        All images (ortho + obliques) and target DSM are rotated by the same angle.
+        Oblique keys are remapped to maintain directional consistency.
+
+        Args:
+            images: Dict with keys 'ortho', 'north', 'south', 'east', 'west'
+                   Each value is (3, 256, 256) tensor
+            target: (1, 64, 64) tensor with normalized heights
+
+        Returns:
+            Tuple of (rotated_images, rotated_target)
+        """
+        # Randomly choose rotation: 0, 1, 2, or 3 (multiples of 90°)
+        k = torch.randint(0, 4, (1,)).item()
+
+        if k == 0:
+            # No rotation
+            return images, target
+
+        # Rotate all image tensors by k*90° clockwise
+        # torch.rot90 rotates counter-clockwise, so use -k for clockwise
+        rotated_images = {}
+        for view, img in images.items():
+            # img is (C, H, W), rotate in the H-W plane (dims=[1, 2])
+            rotated_images[view] = torch.rot90(img, k=-k, dims=[1, 2])
+
+        # Rotate target DSM
+        rotated_target = torch.rot90(target, k=-k, dims=[1, 2])
+
+        # Remap oblique keys to maintain directional consistency
+        rotated_images = self._remap_obliques_for_rotation(rotated_images, k)
+
+        return rotated_images, rotated_target
+
+    def _apply_image_dropout(
+        self,
+        images: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Apply random dropout to input images for robustness.
+
+        Each of the 5 input images has an independent probability of being dropped
+        (replaced with zeros). This makes the model robust to missing or corrupted
+        images in real-world scenarios.
+
+        Args:
+            images: Dict with keys 'ortho', 'north', 'south', 'east', 'west'
+                   Each value is a (3, 256, 256) tensor
+
+        Returns:
+            Dict with same structure, where some images may be zeroed out
+        """
+        if self.drop_prob == 0.0:
+            return images
+
+        dropped_images = {}
+        for view, img in images.items():
+            # Random dropout for each image independently
+            if torch.rand(1).item() < self.drop_prob:
+                # Replace with zeros (zero padding)
+                dropped_images[view] = torch.zeros_like(img)
+            else:
+                dropped_images[view] = img
+
+        return dropped_images
+
     def __len__(self) -> int:
         return len(self.clips)
 
@@ -216,6 +340,14 @@ class HeightEstimationDataset(Dataset):
         # Load target DSM
         target = self._load_and_preprocess_dsm(clip['dsm'])
 
+        # Apply rotation augmentation if enabled
+        if self.augment:
+            images, target = self._apply_rotation_augmentation(images, target)
+
+        # Apply image dropout if enabled (after rotation to drop rotated images)
+        if self.drop_prob > 0:
+            images = self._apply_image_dropout(images)
+
         return images, target
 
     def denormalize_height(self, normalized_height: torch.Tensor) -> torch.Tensor:
@@ -231,7 +363,9 @@ def create_dataloaders(
     data_dir: str,
     batch_size: int = 8,
     num_workers: int = 4,
-    force_recompute: bool = False
+    force_recompute: bool = False,
+    augment: bool = False,
+    drop_prob: float = 0.0
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Dict[str, float]]:
     """Create train and validation dataloaders.
 
@@ -240,6 +374,8 @@ def create_dataloaders(
         batch_size: Batch size for dataloaders
         num_workers: Number of worker processes for data loading
         force_recompute: If True, recompute normalization params even if cached
+        augment: If True, apply rotation augmentation to training data
+        drop_prob: Probability of dropping each input image (0.0-1.0)
 
     Returns:
         train_loader, val_loader, height_norm_params
@@ -260,7 +396,9 @@ def create_dataloaders(
         train_dataset = HeightEstimationDataset(
             data_dir=data_dir,
             split='train',
-            height_norm_params=height_norm_params
+            height_norm_params=height_norm_params,
+            augment=augment,
+            drop_prob=drop_prob
         )
     else:
         # Compute normalization params
@@ -272,7 +410,9 @@ def create_dataloaders(
         train_dataset = HeightEstimationDataset(
             data_dir=data_dir,
             split='train',
-            compute_norm_params=True
+            compute_norm_params=True,
+            augment=augment,
+            drop_prob=drop_prob
         )
 
         # Get and cache normalization params
@@ -283,11 +423,13 @@ def create_dataloaders(
             json.dump(height_norm_params, f, indent=2)
         print(f"Saved normalization params to {cache_file}")
 
-    # Create val dataset with same normalization
+    # Create val dataset with same normalization (no augmentation, no dropout)
     val_dataset = HeightEstimationDataset(
         data_dir=data_dir,
         split='val',
-        height_norm_params=height_norm_params
+        height_norm_params=height_norm_params,
+        augment=False,  # Never augment validation data
+        drop_prob=0.0   # Never drop validation images
     )
 
     # Create dataloaders
