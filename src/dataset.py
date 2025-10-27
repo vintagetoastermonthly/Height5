@@ -61,42 +61,60 @@ class HeightEstimationDataset(Dataset):
             self.height_norm_params = {'min': 0.0, 'max': 255.0}
 
     def _find_valid_clips(self) -> List[Dict[str, any]]:
-        """Find all clips with complete set of 6 files."""
-        # Get all DSM files
-        dsm_files = glob.glob(str(self.data_dir / "*_dsm.png"))
+        """Find all clips with complete set of 6 files.
 
-        valid_clips = []
-        for dsm_path in dsm_files:
-            # Extract clip ID from filename
-            basename = os.path.basename(dsm_path)
-            match = re.match(r'^(\d+)_dsm\.png$', basename)
-            if not match:
+        Optimized version: Uses single os.listdir() instead of multiple glob operations.
+        This is much faster on WSL2 and other slow filesystems.
+        """
+        # Get all files in one operation
+        all_files = os.listdir(self.data_dir)
+
+        # Group files by clip_id
+        clips_dict = {}
+
+        for filename in all_files:
+            # Parse DSM files: <clip>_dsm.png
+            dsm_match = re.match(r'^(\d+)_dsm\.png$', filename)
+            if dsm_match:
+                clip_id = int(dsm_match.group(1))
+                if clip_id not in clips_dict:
+                    clips_dict[clip_id] = {}
+                clips_dict[clip_id]['dsm'] = str(self.data_dir / filename)
                 continue
 
-            clip_id = int(match.group(1))
-            clip_prefix = f"{clip_id}_"
+            # Parse ortho nadir: <clip>_.*_nadir.tiff.jpg
+            ortho_match = re.match(r'^(\d+)_.*_nadir\.tiff\.jpg$', filename)
+            if ortho_match:
+                clip_id = int(ortho_match.group(1))
+                if clip_id not in clips_dict:
+                    clips_dict[clip_id] = {}
+                clips_dict[clip_id]['ortho'] = str(self.data_dir / filename)
+                continue
 
-            # Find corresponding image files
-            ortho_pattern = str(self.data_dir / f"{clip_prefix}*_nadir.tiff.jpg")
-            ortho_files = glob.glob(ortho_pattern)
+            # Parse oblique files: <clip>_.*_oblique-{direction}.tiff.jpg
+            oblique_match = re.match(r'^(\d+)_.*_oblique-(north|south|east|west)\.tiff\.jpg$', filename)
+            if oblique_match:
+                clip_id = int(oblique_match.group(1))
+                direction = oblique_match.group(2)
+                if clip_id not in clips_dict:
+                    clips_dict[clip_id] = {}
+                clips_dict[clip_id][f'oblique_{direction}'] = str(self.data_dir / filename)
+                continue
 
-            oblique_files = {}
-            for direction in ['north', 'south', 'east', 'west']:
-                pattern = str(self.data_dir / f"{clip_prefix}*_oblique-{direction}.tiff.jpg")
-                matches = glob.glob(pattern)
-                if matches:
-                    oblique_files[direction] = matches[0]
+        # Build list of valid clips (those with all 6 files)
+        valid_clips = []
+        required_keys = {'dsm', 'ortho', 'oblique_north', 'oblique_south', 'oblique_east', 'oblique_west'}
 
-            # Check if all files are present
-            if ortho_files and len(oblique_files) == 4:
+        for clip_id, files in clips_dict.items():
+            if required_keys.issubset(files.keys()):
                 valid_clips.append({
                     'clip_id': clip_id,
-                    'dsm': dsm_path,
-                    'ortho': ortho_files[0],
-                    'oblique_north': oblique_files['north'],
-                    'oblique_south': oblique_files['south'],
-                    'oblique_east': oblique_files['east'],
-                    'oblique_west': oblique_files['west'],
+                    'dsm': files['dsm'],
+                    'ortho': files['ortho'],
+                    'oblique_north': files['oblique_north'],
+                    'oblique_south': files['oblique_south'],
+                    'oblique_east': files['oblique_east'],
+                    'oblique_west': files['oblique_west'],
                 })
 
         valid_clips.sort(key=lambda x: x['clip_id'])
