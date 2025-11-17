@@ -180,11 +180,31 @@ Preserved at full 32×32 resolution (1,024 spatial positions).
 
 Use trained model for prediction:
 ```bash
+# Basic inference (64×64 output)
 python src/inference.py \
   --checkpoint checkpoints/best_model.pth \
   --data_dir data \
   --output_dir predictions
+
+# With super-resolution post-processing (256×256 output)
+python src/inference.py \
+  --checkpoint checkpoints/best_model.pth \
+  --data_dir data \
+  --output_dir predictions \
+  --postprocess \
+  --n_segments 500
+
+# Height-aware mode (better for gabled roofs)
+python src/inference.py \
+  --checkpoint checkpoints/best_model.pth \
+  --data_dir data \
+  --output_dir predictions \
+  --postprocess \
+  --height_aware \
+  --variance_threshold 0.5
 ```
+
+**Post-processing**: Uses SLIC superpixel segmentation on RGB ortho to create clean planar surfaces within objects, upsampling from 64×64 to 256×256 with sharp boundaries aligned to RGB edges. Height-aware mode (`--height_aware`) uses height gradient as 4th channel to preserve ridges/multi-plane surfaces not visible in RGB.
 
 ## Testing
 

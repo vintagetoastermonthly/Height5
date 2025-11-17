@@ -9,6 +9,7 @@ from tqdm import tqdm
 from dataset import HeightEstimationDataset
 from model import HeightEstimationModel
 from utils import load_normalization_params, visualize_prediction
+from postprocess import postprocess_batch
 
 
 @torch.no_grad()
@@ -67,6 +68,23 @@ def run_inference(args):
         # Predict
         prediction = model(images_batch)
 
+        # Apply post-processing if requested
+        if args.postprocess:
+            # Extract ortho image for post-processing
+            ortho_batch = images_batch['ortho']  # (1, 3, 256, 256)
+
+            # Apply superpixel plane refinement
+            prediction = postprocess_batch(
+                ortho_batch,
+                prediction,
+                n_segments=args.n_segments,
+                compactness=args.compactness,
+                use_ransac=args.use_ransac,
+                height_aware=args.height_aware,
+                height_weight=args.height_weight,
+                variance_threshold=args.variance_threshold
+            ).to(device)
+
         # Create denormalization function
         h_min = height_norm_params['min']
         h_max = height_norm_params['max']
@@ -113,6 +131,22 @@ if __name__ == '__main__':
                         help='Directory to save predictions')
     parser.add_argument('--save_visualizations', action='store_true',
                         help='Save 7-image strip visualizations')
+
+    # Post-processing arguments
+    parser.add_argument('--postprocess', action='store_true',
+                        help='Apply superpixel plane refinement for super-resolution')
+    parser.add_argument('--n_segments', type=int, default=500,
+                        help='Number of superpixels for SLIC segmentation')
+    parser.add_argument('--compactness', type=float, default=10.0,
+                        help='SLIC compactness parameter (higher = more compact segments)')
+    parser.add_argument('--use_ransac', action='store_true',
+                        help='Use RANSAC for plane fitting (robust to outliers)')
+    parser.add_argument('--height_aware', action='store_true',
+                        help='Use height gradient as 4th channel for segmentation (better for ridges/gabled roofs)')
+    parser.add_argument('--height_weight', type=float, default=10.0,
+                        help='Weight for height channel relative to RGB (only with --height_aware)')
+    parser.add_argument('--variance_threshold', type=float, default=0.5,
+                        help='Split segments with height std > this value (detects multi-plane surfaces)')
 
     args = parser.parse_args()
 

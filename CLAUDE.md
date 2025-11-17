@@ -148,19 +148,54 @@ python src/train.py \
 
 **Run inference:**
 ```bash
-# Run on validation set
+# Basic inference on validation set
 python src/inference.py \
   --checkpoint checkpoints/best_model.pth \
   --data_dir data \
   --split val \
   --output_dir predictions
 
+# With post-processing (super-resolution via superpixel plane refinement)
+python src/inference.py \
+  --checkpoint checkpoints/best_model.pth \
+  --data_dir data \
+  --postprocess \
+  --n_segments 500 \
+  --compactness 10.0
+
+# With height-aware segmentation (better for gabled roofs/ridges)
+python src/inference.py \
+  --checkpoint checkpoints/best_model.pth \
+  --data_dir data \
+  --postprocess \
+  --height_aware \
+  --height_weight 10.0 \
+  --variance_threshold 0.5
+
 # Save visualizations
 python src/inference.py \
   --checkpoint checkpoints/best_model.pth \
   --data_dir data \
-  --save_visualizations
+  --save_visualizations \
+  --postprocess
 ```
+
+**Post-processing (optional):**
+- **Super-resolution**: Upsamples 64×64 predictions to 256×256 using superpixel segmentation
+- **SLIC algorithm**: Segments RGB ortho into superpixels (default: 500 segments)
+- **Planar surfaces**: Fits plane to heights within each superpixel for clean boundaries
+- **Result**: Sharp building edges aligned with RGB, smooth planar surfaces on roofs/ground
+
+**Advanced options:**
+- **Height-aware mode** (`--height_aware`): Uses height gradient as 4th channel for segmentation
+  - Preserves ridges/edges not visible in RGB (e.g., gabled roofs with uniform color)
+  - Detects multi-plane surfaces within uniform colored regions
+  - Recommended for complex roof structures
+- **Variance splitting** (`--variance_threshold 0.5`): Automatically splits segments with high height variance
+  - Handles gabled roofs, steps, terraces within uniform RGB
+  - Higher threshold = less aggressive splitting
+- **RANSAC fitting** (`--use_ransac`): Robust plane fitting with outliers
+  - Slower but better for noisy predictions
 
 **Monitor training:**
 - Training logs: `training_log.csv`
@@ -173,4 +208,5 @@ python src/inference.py \
 - `src/model.py`: Full model architecture (encoder, fusion, decoder)
 - `src/train.py`: Training loop, validation, checkpointing, early stopping
 - `src/inference.py`: Inference script for trained models
+- `src/postprocess.py`: Super-resolution post-processing via superpixel plane refinement
 - `src/utils.py`: Metrics, visualization, learning rate scheduler, CSV logging
